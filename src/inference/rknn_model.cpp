@@ -1,4 +1,4 @@
-#include "inference.h"
+#include "rknn_model.hpp"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -48,7 +48,7 @@ int rknn_model::init(void) {
     int model_size = 0;
     
     // 调用 rknn_init，把模型加载进内存并分配给NPU
-    ret = rknn_init(&ctx, (char *)"/home/cat/gst_core/src/model/yolov5s-640-640.rknn", model_size, 0, NULL);
+    ret = rknn_init(&ctx, (char *)"/home/cat/gst_core/model/yolov5s-640-640.rknn", model_size, 0, NULL);
     if (ret < 0) {
         printf("rknn_init fail! ret=%d\n", ret);
         return -1;
@@ -167,8 +167,8 @@ int rknn_model::run(void) {
         output_order[1] = order[1];
         output_order[2] = order[2];
     }
-    printf("post_process output order: stride8<-output%d stride16<-output%d stride32<-output%d\n",
-           output_order[0], output_order[1], output_order[2]);
+    // printf("post_process output order: stride8<-output%d stride16<-output%d stride32<-output%d\n",
+    //        output_order[0], output_order[1], output_order[2]);
 
     for (int k = 0; k < 3; ++k)
     {

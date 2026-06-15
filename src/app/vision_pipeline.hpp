@@ -12,14 +12,14 @@
 //     float confidence;
 // };
 
-class VisionEngine {
+class VisionPipeline {
 public:
-    VisionEngine();
-    ~VisionEngine();
+    VisionPipeline();
+    ~VisionPipeline();
 
     // 禁用拷贝构造，防止底层资源被意外释放
-    VisionEngine(const VisionEngine&) = delete;
-    VisionEngine& operator=(const VisionEngine&) = delete;
+    VisionPipeline(const VisionPipeline&) = delete;
+    VisionPipeline& operator=(const VisionPipeline&) = delete;
 
     // 1. 生命周期管理
     bool init();          // 初始化 Pipeline，但不启动数据流
@@ -31,8 +31,8 @@ public:
     // void set_inference_callback(InferenceCallback callback);
 
     // 3. WebRTC 信令交互接口 (供外部信令服务器调用)
-    void set_remote_description(const std::string& type, const std::string& sdp);
-    void add_ice_candidate(const std::string& candidate, int sdp_mline_index);
+    // void set_remote_description(const std::string& type, const std::string& sdp);
+    // void add_ice_candidate(const std::string& candidate, int sdp_mline_index);
 
 private:
     // PIMPL 惯用法：前向声明内部实现类

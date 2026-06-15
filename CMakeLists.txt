@@ -16,13 +16,14 @@ pkg_check_modules(GSTREAMER REQUIRED gstreamer-1.0 gstreamer-video-1.0 gstreamer
 # 5. 收集所有的源文件 (.c 和 .cpp)
 # 使用 aux_source_directory 或者手动指定，手动指定更清晰
 set(SOURCE_FILES
-    src/capture/v4l2_camera.c
-    src/core/dma_buffer.c
+    src/camera/v4l2_camera.c
+    src/memory/dma_buffer.c
     test/test.cpp
-    src/stream/vision_engine.cpp
-    src/inference/inference.cpp
+    src/app/vision_pipeline.cpp
+    src/inference/rknn_model.cpp
     src/inference/postprocess.cc
-    src/process/gst_rga.c
+    src/rga/gst_rga.c
+    tool/draw_lines_by_cpu.cpp
     # 如果以后增加了新的模块，直接在这里添加 .c 或 .cpp 文件即可
 )
 
@@ -35,11 +36,13 @@ set_target_properties(gst_app PROPERTIES LINKER_LANGUAGE CXX)
 # 7. 解决“找不到头文件”的问题：设置头文件搜索路径
 # 这里把所有子目录都加进去，你在代码里就可以直接 #include "dma_buffer.h"
 target_include_directories(gst_app PRIVATE
-    src/capture
-    src/core
-    src/stream
+    src/camera
+    src/memory
+    src/app
     src/inference
-    src/process
+    src/rga
+    tool/
+    common
     include/
     ${GSTREAMER_INCLUDE_DIRS}  # GStreamer 的头文件路径
 )

@@ -1,6 +1,7 @@
-#ifndef _INFERENCE_H_   
-#define _INFERENCE_H_
+#pragma once
 
+#include <mutex>
+#include <queue>
 #include <vector>
 #include <stdint.h>
 #include "rknn_api.h"
@@ -34,5 +35,3 @@ public:
     void destroy_model(void);
     int get_dma_fd(void);
 };
-
-#endif
