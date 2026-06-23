@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>RK3588 WebRTC Viewer</title>
+</head>
+<body>
+  <h2>RK3588 WebRTC Video</h2>
+
+  <div>
+    <label>Signaling WebSocket URL:</label>
+    <input id="wsUrl" value="ws://192.168.1.8:8080/ws" style="width: 300px;">
+    <button id="connectBtn">Connect</button>
+  </div>
+
+  <br>
+
+  <video id="video" autoplay playsinline controls style="width: 960px; background: black;"></video>
+
+  <pre id="log"></pre>
+
+  <script src="client.js"></script>
+</body>
+</html>
