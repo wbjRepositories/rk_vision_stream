@@ -65,6 +65,7 @@ private:
     GstAllocator* allocator{nullptr};
     SoupServer *server{nullptr};
     SoupWebsocketConnection *ws_conn{nullptr};
+    GError *error = NULL;
 
     // appsink 到 inference 线程的图像队列和锁
     std::mutex frame_mutex_;
@@ -171,7 +172,7 @@ public:
             "media",            G_TYPE_STRING,  "video",
             "encoding-name",    G_TYPE_STRING,  "H264",
             "payload",          G_TYPE_INT,     96,
-            "clock-rate",       G_TYPE_INT,     9000,
+            "clock-rate",       G_TYPE_INT,     90000,
             NULL);
 
         if (nullptr == rtp_caps) {
@@ -244,6 +245,16 @@ public:
         soup_server_add_websocket_handler (server, "/ws", NULL, NULL,
                                      on_web_connected_cb_static, this, NULL);
         
+        // 让服务器监听本地所有网卡 (0.0.0.0) 的 8080 端口
+        soup_server_listen_all (server, 8080, static_cast<SoupServerListenOptions>(0), &error);
+        if (error) {
+            g_printerr ("WebSocket 服务器启动失败: %s\n", error->message);
+            return -1;
+        }
+
+        g_print ("\n🚀 WebSocket 信令服务器已启动！\n");
+        g_print ("请在网页浏览器中连接: ws://<板子IP>:8080/ws\n\n");
+
         GstPad *mpph264enc_sink_pad = gst_element_get_static_pad(mpph264enc, "sink");
 
         gst_pad_add_probe(
@@ -283,13 +294,13 @@ public:
         v4l2_start_capturing(device_fd, buffers_num, out_buffers);
 
         /* ---- 启动 pipeline ---- */
-        GstStateChangeReturn ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
-        if (ret == GST_STATE_CHANGE_FAILURE) {
-            g_printerr("无法将管道设置为 PLAYING 状态！\n");
-            gst_object_unref(pipeline);
-            // return -1;
-        }
-        g_print("管道已进入 PLAYING 状态，开始推流...\n");
+        // GstStateChangeReturn ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
+        // if (ret == GST_STATE_CHANGE_FAILURE) {
+        //     g_printerr("无法将管道设置为 PLAYING 状态！\n");
+        //     gst_object_unref(pipeline);
+        //     // return -1;
+        // }
+        // g_print("管道已进入 PLAYING 状态，开始推流...\n");
 
         appsrc_thread = std::thread(&Impl::appsrc_push_task,this);
 
@@ -562,22 +573,19 @@ private:
         g_object_unref (builder);
 
         g_free (sdp_text); // 这是上一步 GStreamer 产生的文本
-
-
-
-        g_free (sdp_text);
     }
 
 
-    static void on_web_connected_cb_static(SoupServer *server, SoupServerMessage *msg, const char *path,
-                                            SoupWebsocketConnection *connection, gpointer user_data) {
+    static void on_web_connected_cb_static(SoupServer *server, SoupWebsocketConnection *connection,
+                                            const char *path, SoupClientContext *client,
+                                            gpointer user_data) {
         auto* self = static_cast<Impl*>(user_data);
-        self->on_web_connected_cb(server, msg, path, connection);
+        self->on_web_connected_cb(server, connection, path, client);
     }
 
 
-    void on_web_connected_cb (SoupServer *server, SoupServerMessage *msg, 
-                                const char *path, SoupWebsocketConnection *connection ) {
+    void on_web_connected_cb (SoupServer *server, SoupWebsocketConnection *connection,
+                                const char *path, SoupClientContext *client ) {
 
         g_print ("🎉 叮咚！检测到网页客户端连入 WebSocket!\n");
 
