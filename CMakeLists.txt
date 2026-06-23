@@ -8,10 +8,22 @@ project(lubancat_gst_core LANGUAGES C CXX)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 14)
 
-# 4. 查找依赖库 (GStreamer)
-# 这一步会自动去找系统中 GStreamer 的头文件和库路径
+# 4. 查找依赖库
+# GStreamer 负责采集/编码/WebRTC；libsoup-2.4 负责 WebSocket 信令；
+# json-glib-1.0 负责解析和生成 offer/answer/ICE 的 JSON 消息。
+# 注意：当前 RK3588 镜像里的 GStreamer webrtc 插件依赖 libsoup-2.4。
+# 同一进程不能同时加载 libsoup2 和 libsoup3，所以这里必须跟 GStreamer 保持一致。
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(GSTREAMER REQUIRED gstreamer-1.0 gstreamer-video-1.0 gstreamer-allocators-1.0 gstreamer-app-1.0)
+pkg_check_modules(GSTREAMER REQUIRED
+    gstreamer-1.0
+    gstreamer-video-1.0
+    gstreamer-allocators-1.0
+    gstreamer-app-1.0
+    gstreamer-webrtc-1.0
+    gstreamer-sdp-1.0
+    libsoup-3.0
+    json-glib-1.0
+)
 
 # 5. 收集所有的源文件 (.c 和 .cpp)
 # 使用 aux_source_directory 或者手动指定，手动指定更清晰
@@ -32,6 +44,14 @@ add_executable(gst_app ${SOURCE_FILES})
 
 # 显式指定使用 C++ 链接器，确保链接 libstdc++
 set_target_properties(gst_app PROPERTIES LINKER_LANGUAGE CXX)
+
+# webrtcbin 来自 gst-plugins-bad，GStreamer 头文件要求显式确认使用不稳定 API。
+# BROWSER_CLIENT_DIR 编译进程序后，无论从源码目录还是 build/ 目录启动，
+# HTTP 页面服务都能找到 browser_client/index.html 和 client.js。
+target_compile_definitions(gst_app PRIVATE
+    GST_USE_UNSTABLE_API
+    BROWSER_CLIENT_DIR="${CMAKE_SOURCE_DIR}/browser_client"
+)
 
 # 7. 解决“找不到头文件”的问题：设置头文件搜索路径
 # 这里把所有子目录都加进去，你在代码里就可以直接 #include "dma_buffer.h"

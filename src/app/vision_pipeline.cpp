@@ -24,7 +24,9 @@
 #include <linux/dma-buf.h>
 #include "config.h"
 #include "draw_lines_by_cpu.hpp"
-
+#include <gst/webrtc/webrtc.h>
+#include <json-glib/json-glib.h>
+#include <libsoup/soup.h>
 
 extern std::queue<BoundingBox> g_bb_q;
 extern std::mutex g_queue_mutex;
@@ -61,6 +63,8 @@ private:
     GstElement* webrtcbin{nullptr};
     GMainLoop*  main_loop{nullptr};
     GstAllocator* allocator{nullptr};
+    SoupServer *server{nullptr};
+    SoupWebsocketConnection *ws_conn{nullptr};
 
     // appsink 到 inference 线程的图像队列和锁
     std::mutex frame_mutex_;
@@ -134,38 +138,57 @@ public:
         GstElement *mpph264enc  = gst_element_factory_make("mpph264enc",    "mpph264enc");
         GstElement *h264parse   = gst_element_factory_make("h264parse",    "h264parse");
         GstElement *rtph264pay  = gst_element_factory_make("rtph264pay",    "rtph264pay");
-        GstElement *udpsink     = gst_element_factory_make("udpsink",       "udpsink");
+        webrtcbin     = gst_element_factory_make("webrtcbin",       "webrtcbin");
+        GstElement *rtp_capsfilter = gst_element_factory_make("capsfilter", "rtp_caps");
 
-        if (!appsrc || !tee || !queue_rga || !appsink || !queue_trans || !mpph264enc || !h264parse || !rtph264pay || !udpsink) {
+        if (!appsrc || !tee || !queue_rga || !appsink || !queue_trans || !mpph264enc || !h264parse || !rtph264pay || !webrtcbin || !rtp_capsfilter) {
             GST_ERROR("有元件创建失败，请检查插件是否安装！\n");
             return false;
         }
 
-        GstCaps *caps = gst_caps_new_simple("video/x-raw",
+        GstCaps *appsrc_caps = gst_caps_new_simple("video/x-raw",
             "width",     G_TYPE_INT,  VIDEO_WIDTH,
             "height",    G_TYPE_INT,  VIDEO_HEIGHT,
             "format",    G_TYPE_STRING, "NV12",
             "framerate", GST_TYPE_FRACTION, VIDEO_FPS, 1,
             NULL);
 
-        if (nullptr == caps) {
-            GST_ERROR("gst_caps_new_simple 失败！\n");
+        if (nullptr == appsrc_caps) {
+            GST_ERROR("appsrc_caps gst_caps_new_simple 失败！\n");
             return false;
         }
 
-        g_object_set(appsrc, "caps", caps, NULL);
-        gst_caps_unref(caps);
+        g_object_set(appsrc, "caps", appsrc_caps, NULL);
+        gst_caps_unref(appsrc_caps);
 
         g_object_set(appsrc,
             "is-live", TRUE,
             "format",  GST_FORMAT_TIME,
             NULL);
 
-        g_object_set(rtph264pay, "config-interval", 1, NULL);
-        g_object_set(udpsink, "host", REMOTE_ADDRESS, "port", REMOTE_PORT, NULL);
+        
+        GstCaps *rtp_caps = gst_caps_new_simple("application/x-rtp",
+            "media",            G_TYPE_STRING,  "video",
+            "encoding-name",    G_TYPE_STRING,  "H264",
+            "payload",          G_TYPE_INT,     96,
+            "clock-rate",       G_TYPE_INT,     9000,
+            NULL);
+
+        if (nullptr == rtp_caps) {
+            GST_ERROR("rtp_caps gst_caps_new_simple 失败！\n");
+            return false;
+        }
+        g_object_set(rtp_capsfilter, "caps", rtp_caps, NULL);
+        gst_caps_unref(rtp_caps);
+
+        g_object_set(rtph264pay, "config-interval", 1, "pt", 96, NULL);
+        // g_object_set(udpsink, "host", REMOTE_ADDRESS, "port", REMOTE_PORT, NULL);
+
+        g_object_set(webrtcbin, "bundle-policy", GST_WEBRTC_BUNDLE_POLICY_MAX_BUNDLE, NULL);
 
         gst_bin_add_many(GST_BIN(pipeline),
-                        appsrc, tee, queue_rga, appsink, queue_trans, mpph264enc, h264parse, rtph264pay, udpsink, NULL);
+                        appsrc, tee, queue_rga, appsink, queue_trans, mpph264enc, 
+                        h264parse, rtph264pay, rtp_capsfilter, webrtcbin, NULL);
 
         // 分支1
         GstPad *tee_src0 = gst_element_request_pad_simple(tee, "src_%u");
@@ -186,7 +209,7 @@ public:
         }
 
         if (!gst_element_link_many(queue_trans, mpph264enc, h264parse,
-                                    rtph264pay, udpsink, NULL)) {
+                                    rtph264pay, rtp_capsfilter, NULL)) {
             g_printerr("元件连接失败！可能是数据格式不兼容。\n");
             return false;
         }
@@ -203,6 +226,23 @@ public:
             GST_ERROR("tee2 连接失败！\n");
         }
 
+
+        GstPad *rtp_srcpad = gst_element_get_static_pad(rtp_capsfilter, "src");
+        GstPad *webrtc_sinkpad = gst_element_request_pad_simple(webrtcbin, "sink_%u");
+
+        if (gst_pad_link(rtp_srcpad, webrtc_sinkpad) != GST_PAD_LINK_OK) {
+            g_printerr("Failed to link RTP branch to webrtcbin\n");
+        }
+        gst_object_unref(rtp_srcpad);
+        gst_object_unref(webrtc_sinkpad);
+
+        g_signal_connect(webrtcbin, "on-negotiation-needed", G_CALLBACK(on_negotiation_needed_cb_static), this);
+        g_signal_connect (webrtcbin, "on-ice-candidate", G_CALLBACK (on_ice_candidate_cb_static), this);
+
+        server = soup_server_new (NULL, NULL);
+
+        soup_server_add_websocket_handler (server, "/ws", NULL, NULL,
+                                     on_web_connected_cb_static, this, NULL);
         
         GstPad *mpph264enc_sink_pad = gst_element_get_static_pad(mpph264enc, "sink");
 
@@ -389,6 +429,275 @@ private:
 
         return GST_FLOW_OK;
     }
+
+    static void on_negotiation_needed_cb_static(GstElement* webrtcbin, gpointer user_data) {
+        auto* self = static_cast<Impl*>(user_data);
+        self->on_negotiation_needed_cb(webrtcbin);
+    }
+
+    // ⚖️ 当 WebRTC 准备好进行媒体协商时，这个函数会被触发
+    void on_negotiation_needed_cb (GstElement * webrtcbin)
+    {
+        g_print ("正在向 webrtcbin 发送 create-offer 指令...\n");
+        // 创建一个 Promise，并指定当 Offer 生成完毕后，去执行 on_offer_created_cb 函数
+        // 同时继续把 app 传递下去
+        GstPromise *promise = gst_promise_new_with_change_func (on_offer_created_cb_static, this, NULL);
+
+        // 发射指令：创建 Offer！
+        g_signal_emit_by_name (webrtcbin, "create-offer", NULL, promise);
+    }
+
+    static void on_ice_candidate_cb_static(GstElement * webrtcbin, guint mlineindex, gchar * candidate, gpointer user_data) {
+        auto* self = static_cast<Impl*>(user_data);
+        self->on_ice_candidate_cb(webrtcbin, mlineindex, candidate);
+    }
+
+    // 🧊 当底层引擎找到一条本地网络路径时，这个函数会被触发
+    void on_ice_candidate_cb (GstElement * webrtcbin, guint mlineindex, gchar * candidate)
+    {
+        if (!ws_conn) return; // 网页如果中途掉线了，就不发
+
+        JsonBuilder *builder = json_builder_new ();
+        json_builder_begin_object (builder);
+
+        json_builder_set_member_name (builder, "type");
+        json_builder_add_string_value (builder, "ice");
+
+        json_builder_set_member_name (builder, "sdpMLineIndex");
+        json_builder_add_int_value (builder, mlineindex);
+
+        json_builder_set_member_name (builder, "candidate");
+        json_builder_add_string_value (builder, candidate);
+
+        json_builder_end_object (builder);
+
+        JsonNode *root = json_builder_get_root (builder);
+        JsonGenerator *gen = json_generator_new ();
+        json_generator_set_root (gen, root);
+
+        gchar *json_str = json_generator_to_data (gen, NULL);
+        
+        g_print ("--> 发送板子本地 ICE 给网页: %s\n", candidate);
+
+        // 通过 WebSocket 推给网页！
+        soup_websocket_connection_send_text (ws_conn, json_str);
+
+        g_free (json_str);
+        g_object_unref (gen);
+        json_node_free (root);
+        g_object_unref (builder);
+    }
+
+    static void on_offer_created_cb_static(GstPromise * promise, gpointer user_data) {
+        auto* self = static_cast<Impl*>(user_data);
+        self->on_offer_created_cb(promise);
+    }
+
+    void on_offer_created_cb (GstPromise * promise) {
+        GstWebRTCSessionDescription *offer = NULL;
+        
+        // 1. 获取 Promise 的返回值（里面装载了刚刚生成的 Offer）
+        const GstStructure *reply = gst_promise_get_reply (promise);
+        
+        // 2. 从返回值中提取出名为 "offer" 的对象
+        gst_structure_get (reply, "offer",
+                            GST_TYPE_WEBRTC_SESSION_DESCRIPTION, &offer, NULL);
+
+        // 此时，你可以把 offer 里的纯文本打印出来看看长啥样
+        gchar *sdp_text = gst_sdp_message_as_text (offer->sdp);
+        g_print ("生成的 Offer SDP:\n%s\n", sdp_text);
+
+        // 3. 关键动作：签发“本地描述”
+        g_print ("正在将生成的 Offer 设置为 Local Description...\n");
+        GstPromise *local_desc_promise = gst_promise_new (); // 设置本地描述也需要一个空的 promise
+        g_signal_emit_by_name (webrtcbin, "set-local-description", offer, local_desc_promise);
+        
+        // 释放资源
+        gst_promise_interrupt (local_desc_promise);
+        gst_promise_unref (local_desc_promise);
+        gst_webrtc_session_description_free (offer);
+        gst_promise_unref (promise);
+        
+        // ==========================================
+        // 💡 下一步：在这里，我们要用 json-glib 把 sdp_text 打包，
+        // 然后用 libsoup 发送给信令服务器！
+        // ==========================================
+        JsonBuilder *builder = json_builder_new ();
+
+        // 2. 开始构建一个 JSON 对象 { ... }
+        json_builder_begin_object (builder);
+
+        // 添加 "type" 字段
+        json_builder_set_member_name (builder, "type");
+        json_builder_add_string_value (builder, "offer");
+
+        // 添加 "sdp" 字段，并把刚才获取的 sdp_text 填进去
+        json_builder_set_member_name (builder, "sdp");
+        json_builder_add_string_value (builder, "sdp_text");
+
+        // 结束构建该对象
+        json_builder_end_object (builder);
+
+        // 3. 将构建好的积木转化为节点 (Node)
+        JsonNode *root = json_builder_get_root (builder);
+
+        // 4. 使用生成器 (Generator) 把节点序列化为纯文本字符串
+        JsonGenerator *gen = json_generator_new ();
+        json_generator_set_root (gen, root);
+        
+        // 获取最终要通过网络发送的 JSON 字符串
+        gchar *json_string = json_generator_to_data (gen, NULL);
+
+        g_print ("准备发送给远端的 JSON:\n%s\n", json_string);
+
+        // ==========================================
+        // 🚀 下一步：调用 libsoup-3.0 的发送函数，把 json_string 发出去！
+        soup_websocket_connection_send_text (ws_conn, json_string);
+        // ==========================================
+
+        // 5. 释放使用过的 json 对象和字符串内存，防止内存泄漏
+        g_free (json_string);
+        g_object_unref (gen);
+        json_node_free (root);
+        g_object_unref (builder);
+
+        g_free (sdp_text); // 这是上一步 GStreamer 产生的文本
+
+
+
+        g_free (sdp_text);
+    }
+
+
+    static void on_web_connected_cb_static(SoupServer *server, SoupServerMessage *msg, const char *path,
+                                            SoupWebsocketConnection *connection, gpointer user_data) {
+        auto* self = static_cast<Impl*>(user_data);
+        self->on_web_connected_cb(server, msg, path, connection);
+    }
+
+
+    void on_web_connected_cb (SoupServer *server, SoupServerMessage *msg, 
+                                const char *path, SoupWebsocketConnection *connection ) {
+
+        g_print ("🎉 叮咚！检测到网页客户端连入 WebSocket!\n");
+
+        // 如果之前已经有网页连着，先把它顶掉（这里做单播演示，方便理解）
+        if (ws_conn != NULL) {
+            g_print ("正在断开旧的网页连接...\n");
+            g_object_unref (ws_conn);
+        }
+
+        // 1. 把它存进上下文，并增加引用计数保活
+        ws_conn = g_object_ref (connection);
+
+        // 2. 绑定“收到网页消息”的信号（用来收网页发回来的 Answer 和 ICE）
+        g_signal_connect (connection, "message", G_CALLBACK (on_ws_message_cb_static), this);
+        
+        // 3. 绑定“网页关掉浏览器”的信号
+        g_signal_connect (connection, "closed", G_CALLBACK (on_ws_closed_cb_static), this);
+
+        // 4. 🚀🚀🚀 全场最核心的一步：点燃导火索！
+        g_print ("正在唤醒 GStreamer 管道开始推流...\n");
+        
+        gst_element_set_state (pipeline, GST_STATE_PLAYING);
+    }
+
+
+    static void on_ws_message_cb_static(SoupWebsocketConnection *connection, gint type, GBytes *message, gpointer user_data) {
+        auto* self = static_cast<Impl*>(user_data);
+        self->on_ws_message_cb(connection, type, message);
+    }
+
+    void on_ws_message_cb (SoupWebsocketConnection *connection, gint type, GBytes *message) {
+        gsize size;
+        const gchar *data;
+        GError *error = NULL;
+
+        // 1. WebSocket 规范：过滤掉非文本的二进制杂音
+        if (type != SOUP_WEBSOCKET_DATA_TEXT) {
+            return;
+        }
+
+        // 从 GBytes 中把原始字符串连同长度一起拔出来
+        data = static_cast<const gchar *>(g_bytes_get_data(message, &size));
+        g_print ("\n📥 收到网页端 JSON (长度 %" G_GSIZE_FORMAT " 字节):\n%s\n", size, data);
+
+        // 2. 召唤 json-glib 解析器
+        JsonParser *parser = json_parser_new ();
+        if (!json_parser_load_from_data (parser, data, size, &error)) {
+            g_printerr ("糟糕，网页发的 JSON 格式烂了: %s\n", error->message);
+            g_clear_error (&error);
+            g_object_unref (parser);
+            return;
+        }
+
+        // 获取 JSON 的根 Object
+        JsonObject *root_obj = json_node_get_object (json_parser_get_root (parser));
+        if (!json_object_has_member (root_obj, "type")) {
+            g_printerr ("收到不明包裹（缺少 'type' 字段）\n");
+            g_object_unref (parser);
+            return;
+        }
+
+        const gchar *msg_type = json_object_get_string_member (root_obj, "type");
+
+        // ==================== 分支 A：处理远端 Answer ====================
+        if (g_strcmp0 (msg_type, "answer") == 0) {
+            const gchar *sdp_str = json_object_get_string_member (root_obj, "sdp");
+            GstSDPMessage *sdp = NULL;
+            GstWebRTCSessionDescription *answer = NULL;
+
+            g_print ("--> 正在解析远端 Answer SDP...\n");
+            if (gst_sdp_message_new_from_text (sdp_str, &sdp) == GST_SDP_OK) {
+            
+            // 把原始 SDP 文本包装成 WebRTC 专用的 Answer 结构体
+            answer = gst_webrtc_session_description_new (GST_WEBRTC_SDP_TYPE_ANSWER, sdp);
+            
+            // 动作指令：设置远端描述！(同样需要一个占位的 promise)
+            GstPromise *promise = gst_promise_new ();
+            g_signal_emit_by_name (webrtcbin, "set-remote-description", answer, promise);
+
+            gst_promise_interrupt (promise);
+            gst_promise_unref (promise);
+            gst_webrtc_session_description_free (answer);
+            
+            g_print ("✅ 远端 Answer 设置成功！握手进度 50%%\n");
+            } else {
+            g_printerr ("无法将 Answer 文本转为 GstSDPMessage！\n");
+            }
+        } 
+        // ==================== 分支 B：处理远端 ICE ====================
+        else if (g_strcmp0 (msg_type, "ice") == 0) {
+            gint mline_index = json_object_get_int_member (root_obj, "sdpMLineIndex");
+            const gchar *candidate_str = json_object_get_string_member (root_obj, "candidate");
+
+            g_print ("--> 收到远端网络路径 (ICE): index=%d, %s\n", mline_index, candidate_str);
+
+            // 动作指令：喂给 GStreamer 底层引擎去打洞！
+            g_signal_emit_by_name (webrtcbin, "add-ice-candidate", mline_index, candidate_str);
+        } 
+        else {
+            g_print ("未知的包裹类型: %s\n", msg_type);
+        }
+
+        // 释放解析器，绝不漏一滴内存
+        g_object_unref (parser);
+    }
+
+    static void on_ws_closed_cb_static(SoupWebsocketConnection *connection, gpointer user_data) {
+        auto* self = static_cast<Impl*>(user_data);
+        self->on_ws_closed_cb(connection);
+    }
+
+    void on_ws_closed_cb (SoupWebsocketConnection *connection) {
+        g_print ("🛑 网页端关闭了连接，暂停底层流媒体推流。\n");
+        
+        // 网页跑了，把管道设回 NULL 节约板子 CPU，等下一个人进来再重新启动
+        gst_element_set_state (pipeline, GST_STATE_NULL);
+        g_clear_object (&ws_conn);
+    }
+
+
 
 
     // 独立的推理线程
