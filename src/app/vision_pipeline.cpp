@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <iostream>
 #include <queue>
+#include <string>
 #include <vector>
 #include "v4l2_camera.h"
 #include <gst/app/gstappsrc.h>
@@ -65,6 +66,8 @@ private:
     GstAllocator* allocator{nullptr};
     SoupServer *server{nullptr};
     SoupWebsocketConnection *ws_conn{nullptr};
+    std::mutex ws_mutex_;
+    std::string ws_peer_ip_;
 
     // appsink 到 inference 线程的图像队列和锁
     std::mutex frame_mutex_;
@@ -77,6 +80,9 @@ private:
     std::thread loop_thread;         // 专门跑 GMainLoop 处理异步事件
     std::thread inference_thread;    // 专门跑 YOLO 推理
     std::atomic<bool> is_running{false};
+    std::atomic<bool> offer_in_progress{false};
+    std::atomic<bool> remote_answer_set{false};
+    std::atomic<guint64> rtp_packet_count{0};
 
 public:
     Impl() = default;
@@ -171,7 +177,7 @@ public:
             "media",            G_TYPE_STRING,  "video",
             "encoding-name",    G_TYPE_STRING,  "H264",
             "payload",          G_TYPE_INT,     96,
-            "clock-rate",       G_TYPE_INT,     9000,
+            "clock-rate",       G_TYPE_INT,     90000,
             NULL);
 
         if (nullptr == rtp_caps) {
@@ -181,6 +187,14 @@ public:
         g_object_set(rtp_capsfilter, "caps", rtp_caps, NULL);
         gst_caps_unref(rtp_caps);
 
+        g_object_set(mpph264enc,
+            "profile", 66,          // baseline; 默认 high(100) 会让部分浏览器拒绝 WebRTC H264
+            "level",   51,          // 5.1，适配 3840x2160@30fps
+            "gop",     VIDEO_FPS,
+            "bps",     12000000,
+            NULL);
+
+        g_object_set(h264parse, "config-interval", 1, NULL);
         g_object_set(rtph264pay, "config-interval", 1, "pt", 96, NULL);
         // g_object_set(udpsink, "host", REMOTE_ADDRESS, "port", REMOTE_PORT, NULL);
 
@@ -199,18 +213,18 @@ public:
         GstPad *pad_q_trans = gst_element_get_static_pad(queue_trans, "sink");
 
         if (!gst_element_link(appsrc, tee)) {
-            g_printerr("元件连接失败！可能是数据格式不兼容。\n");
+            g_printerr("appsrc, tee元件连接失败！可能是数据格式不兼容。\n");
             return false;
         }
                         
         if (!gst_element_link_many(queue_rga, appsink, NULL)) {
-            g_printerr("元件连接失败！可能是数据格式不兼容。\n");
+            g_printerr("queue_rga, appsink元件连接失败！可能是数据格式不兼容。\n");
             return false;
         }
 
         if (!gst_element_link_many(queue_trans, mpph264enc, h264parse,
                                     rtph264pay, rtp_capsfilter, NULL)) {
-            g_printerr("元件连接失败！可能是数据格式不兼容。\n");
+            g_printerr("queue_trans, mpph264enc, h264parse, rtph264pay, rtp_capsfilter元件连接失败！可能是数据格式不兼容。\n");
             return false;
         }
 
@@ -238,11 +252,25 @@ public:
 
         g_signal_connect(webrtcbin, "on-negotiation-needed", G_CALLBACK(on_negotiation_needed_cb_static), this);
         g_signal_connect (webrtcbin, "on-ice-candidate", G_CALLBACK (on_ice_candidate_cb_static), this);
+        g_signal_connect(webrtcbin, "notify::ice-connection-state", G_CALLBACK(on_webrtc_notify_cb_static), this);
+        g_signal_connect(webrtcbin, "notify::connection-state", G_CALLBACK(on_webrtc_notify_cb_static), this);
+        g_signal_connect(webrtcbin, "notify::ice-gathering-state", G_CALLBACK(on_webrtc_notify_cb_static), this);
+        g_signal_connect(webrtcbin, "notify::signaling-state", G_CALLBACK(on_webrtc_notify_cb_static), this);
 
         server = soup_server_new (NULL, NULL);
 
+        soup_server_add_handler(server, NULL, on_http_request_cb_static, this, NULL);
         soup_server_add_websocket_handler (server, "/ws", NULL, NULL,
                                      on_web_connected_cb_static, this, NULL);
+
+        GError *listen_error = NULL;
+        if (!soup_server_listen_all(server, 8080, static_cast<SoupServerListenOptions>(0), &listen_error)) {
+            g_printerr("libsoup 监听 8080 端口失败: %s\n",
+                       listen_error ? listen_error->message : "unknown error");
+            g_clear_error(&listen_error);
+            return false;
+        }
+        g_print("HTTP/WebSocket 信令服务已启动: http://0.0.0.0:8080/  ws://0.0.0.0:8080/ws\n");
         
         GstPad *mpph264enc_sink_pad = gst_element_get_static_pad(mpph264enc, "sink");
 
@@ -253,6 +281,17 @@ public:
             NULL, // 传给回调的用户数据
             NULL  // 销毁回调时的清理函数
         );
+        gst_object_unref(mpph264enc_sink_pad);
+
+        GstPad *rtph264pay_src_pad = gst_element_get_static_pad(rtph264pay, "src");
+        gst_pad_add_probe(
+            rtph264pay_src_pad,
+            GST_PAD_PROBE_TYPE_BUFFER,
+            on_rtp_buffer_probe_static,
+            this,
+            NULL
+        );
+        gst_object_unref(rtph264pay_src_pad);
 
 
         gst_object_unref(pad_q_rga);
@@ -378,6 +417,129 @@ private:
         return TRUE;
     }
 
+    bool send_ws_text(const gchar *text) {
+        SoupWebsocketConnection *connection = nullptr;
+
+        {
+            std::lock_guard<std::mutex> lock(ws_mutex_);
+            if (!ws_conn || !SOUP_IS_WEBSOCKET_CONNECTION(ws_conn)) {
+                return false;
+            }
+            connection = SOUP_WEBSOCKET_CONNECTION(g_object_ref(ws_conn));
+        }
+
+        bool sent = false;
+        if (soup_websocket_connection_get_state(connection) == SOUP_WEBSOCKET_STATE_OPEN) {
+            soup_websocket_connection_send_text(connection, text);
+            sent = true;
+        }
+
+        g_object_unref(connection);
+        return sent;
+    }
+
+    bool has_open_ws_connection() {
+        SoupWebsocketConnection *connection = nullptr;
+
+        {
+            std::lock_guard<std::mutex> lock(ws_mutex_);
+            if (!ws_conn || !SOUP_IS_WEBSOCKET_CONNECTION(ws_conn)) {
+                return false;
+            }
+            connection = SOUP_WEBSOCKET_CONNECTION(g_object_ref(ws_conn));
+        }
+
+        bool is_open = soup_websocket_connection_get_state(connection) == SOUP_WEBSOCKET_STATE_OPEN;
+        g_object_unref(connection);
+        return is_open;
+    }
+
+    static void on_webrtc_notify_cb_static(GObject *object, GParamSpec *pspec, gpointer user_data) {
+        auto* self = static_cast<Impl*>(user_data);
+        self->on_webrtc_notify_cb(object, pspec);
+    }
+
+    void on_webrtc_notify_cb(GObject *object, GParamSpec *pspec) {
+        GValue value = G_VALUE_INIT;
+        g_value_init(&value, pspec->value_type);
+        g_object_get_property(object, pspec->name, &value);
+
+        if (G_VALUE_HOLDS_ENUM(&value)) {
+            gint enum_value_int = g_value_get_enum(&value);
+            GEnumClass *enum_class = G_ENUM_CLASS(g_type_class_ref(pspec->value_type));
+            GEnumValue *enum_value = g_enum_get_value(enum_class, enum_value_int);
+            g_print("webrtcbin %s: %s\n", pspec->name,
+                    enum_value ? enum_value->value_nick : "unknown");
+            g_type_class_unref(enum_class);
+        }
+
+        g_value_unset(&value);
+    }
+
+    static GstPadProbeReturn on_rtp_buffer_probe_static(GstPad *pad, GstPadProbeInfo *info,
+                                                        gpointer user_data) {
+        auto* self = static_cast<Impl*>(user_data);
+        return self->on_rtp_buffer_probe(pad, info);
+    }
+
+    GstPadProbeReturn on_rtp_buffer_probe(GstPad *pad, GstPadProbeInfo *info) {
+        guint64 count = ++rtp_packet_count;
+        if (count == 1 || count % 300 == 0) {
+            g_print("RTP H264 包已送到 webrtcbin 前: %" G_GUINT64_FORMAT "\n", count);
+        }
+        return GST_PAD_PROBE_OK;
+    }
+
+    void update_ws_peer_ip(SoupClientContext *client) {
+        ws_peer_ip_.clear();
+
+        GSocketAddress *remote_address = soup_client_context_get_remote_address(client);
+        if (!remote_address || !G_IS_INET_SOCKET_ADDRESS(remote_address)) {
+            g_print("无法获取 WebSocket 对端 IP，遇到 .local ICE candidate 时可能无法连通。\n");
+            return;
+        }
+
+        GInetAddress *inet_address = g_inet_socket_address_get_address(G_INET_SOCKET_ADDRESS(remote_address));
+        gchar *ip = g_inet_address_to_string(inet_address);
+        if (ip) {
+            ws_peer_ip_ = ip;
+            g_print("WebSocket 对端 IP: %s\n", ws_peer_ip_.c_str());
+            g_free(ip);
+        }
+    }
+
+    std::string rewrite_mdns_candidate_if_needed(const gchar *candidate) {
+        if (!candidate) {
+            return std::string();
+        }
+        if (g_strstr_len(candidate, -1, ".local") == NULL) {
+            return std::string(candidate);
+        }
+        if (ws_peer_ip_.empty()) {
+            g_print("收到 .local ICE candidate，但没有 WebSocket 对端 IP，无法改写。\n");
+            return std::string(candidate);
+        }
+
+        gchar **tokens = g_strsplit(candidate, " ", 0);
+        if (!tokens || !tokens[0] || !tokens[1] || !tokens[2] || !tokens[3] || !tokens[4] || !tokens[5]) {
+            g_strfreev(tokens);
+            return std::string(candidate);
+        }
+
+        if (g_str_has_suffix(tokens[4], ".local")) {
+            g_print("将浏览器 .local ICE 地址改写为 WebSocket 对端 IP: %s -> %s\n",
+                    tokens[4], ws_peer_ip_.c_str());
+            g_free(tokens[4]);
+            tokens[4] = g_strdup(ws_peer_ip_.c_str());
+        }
+
+        gchar *rewritten = g_strjoinv(" ", tokens);
+        std::string result = rewritten ? rewritten : candidate;
+        g_free(rewritten);
+        g_strfreev(tokens);
+        return result;
+    }
+
 
     // 这是 appsink 的 C 风格回调，我们通过 user_data 把 C++ 的 this 指针传进来
     static GstFlowReturn on_new_sample_static(GstElement* sink, gpointer user_data) {
@@ -438,6 +600,22 @@ private:
     // ⚖️ 当 WebRTC 准备好进行媒体协商时，这个函数会被触发
     void on_negotiation_needed_cb (GstElement * webrtcbin)
     {
+        if (!has_open_ws_connection()) {
+            g_print("WebSocket 未连接，暂不创建 Offer，等待浏览器连接。\n");
+            return;
+        }
+
+        if (remote_answer_set) {
+            g_print("已收到 Answer，忽略后续 on-negotiation-needed，避免重复协商。\n");
+            return;
+        }
+
+        bool already_in_progress = offer_in_progress.exchange(true);
+        if (already_in_progress) {
+            g_print("已有 Offer 正在等待 Answer，忽略重复 on-negotiation-needed。\n");
+            return;
+        }
+
         g_print ("正在向 webrtcbin 发送 create-offer 指令...\n");
         // 创建一个 Promise，并指定当 Offer 生成完毕后，去执行 on_offer_created_cb 函数
         // 同时继续把 app 传递下去
@@ -455,8 +633,6 @@ private:
     // 🧊 当底层引擎找到一条本地网络路径时，这个函数会被触发
     void on_ice_candidate_cb (GstElement * webrtcbin, guint mlineindex, gchar * candidate)
     {
-        if (!ws_conn) return; // 网页如果中途掉线了，就不发
-
         JsonBuilder *builder = json_builder_new ();
         json_builder_begin_object (builder);
 
@@ -480,7 +656,9 @@ private:
         g_print ("--> 发送板子本地 ICE 给网页: %s\n", candidate);
 
         // 通过 WebSocket 推给网页！
-        soup_websocket_connection_send_text (ws_conn, json_str);
+        if (!send_ws_text(json_str)) {
+            g_print ("WebSocket 未连接或已关闭，跳过发送本地 ICE。\n");
+        }
 
         g_free (json_str);
         g_object_unref (gen);
@@ -533,7 +711,7 @@ private:
 
         // 添加 "sdp" 字段，并把刚才获取的 sdp_text 填进去
         json_builder_set_member_name (builder, "sdp");
-        json_builder_add_string_value (builder, "sdp_text");
+        json_builder_add_string_value (builder, sdp_text);
 
         // 结束构建该对象
         json_builder_end_object (builder);
@@ -551,8 +729,11 @@ private:
         g_print ("准备发送给远端的 JSON:\n%s\n", json_string);
 
         // ==========================================
-        // 🚀 下一步：调用 libsoup-3.0 的发送函数，把 json_string 发出去！
-        soup_websocket_connection_send_text (ws_conn, json_string);
+        // 下一步：调用 libsoup-2.4 的发送函数，把 json_string 发出去！
+        if (!send_ws_text(json_string)) {
+            g_print ("WebSocket 未连接或已关闭，跳过发送 Offer。\n");
+            offer_in_progress = false;
+        }
         // ==========================================
 
         // 5. 释放使用过的 json 对象和字符串内存，防止内存泄漏
@@ -561,34 +742,40 @@ private:
         json_node_free (root);
         g_object_unref (builder);
 
-        g_free (sdp_text); // 这是上一步 GStreamer 产生的文本
-
-
-
         g_free (sdp_text);
     }
 
 
-    static void on_web_connected_cb_static(SoupServer *server, SoupServerMessage *msg, const char *path,
-                                            SoupWebsocketConnection *connection, gpointer user_data) {
+    static void on_web_connected_cb_static(SoupServer *server, SoupWebsocketConnection *connection,
+                                            const char *path, SoupClientContext *client,
+                                            gpointer user_data) {
         auto* self = static_cast<Impl*>(user_data);
-        self->on_web_connected_cb(server, msg, path, connection);
+        self->on_web_connected_cb(server, connection, path, client);
     }
 
 
-    void on_web_connected_cb (SoupServer *server, SoupServerMessage *msg, 
-                                const char *path, SoupWebsocketConnection *connection ) {
+    void on_web_connected_cb (SoupServer *server, SoupWebsocketConnection *connection,
+                                const char *path, SoupClientContext *client ) {
 
         g_print ("🎉 叮咚！检测到网页客户端连入 WebSocket!\n");
+        update_ws_peer_ip(client);
 
-        // 如果之前已经有网页连着，先把它顶掉（这里做单播演示，方便理解）
-        if (ws_conn != NULL) {
-            g_print ("正在断开旧的网页连接...\n");
-            g_object_unref (ws_conn);
+        SoupWebsocketConnection *old_conn = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(ws_mutex_);
+            if (ws_conn != NULL && ws_conn != connection) {
+                old_conn = ws_conn;
+            }
+            ws_conn = SOUP_WEBSOCKET_CONNECTION(g_object_ref(connection));
         }
+        offer_in_progress = false;
+        remote_answer_set = false;
 
-        // 1. 把它存进上下文，并增加引用计数保活
-        ws_conn = g_object_ref (connection);
+        if (old_conn != nullptr) {
+            g_print ("正在断开旧的网页连接...\n");
+            soup_websocket_connection_close(old_conn, SOUP_WEBSOCKET_CLOSE_GOING_AWAY, "new client connected");
+            g_object_unref(old_conn);
+        }
 
         // 2. 绑定“收到网页消息”的信号（用来收网页发回来的 Answer 和 ICE）
         g_signal_connect (connection, "message", G_CALLBACK (on_ws_message_cb_static), this);
@@ -600,6 +787,60 @@ private:
         g_print ("正在唤醒 GStreamer 管道开始推流...\n");
         
         gst_element_set_state (pipeline, GST_STATE_PLAYING);
+        on_negotiation_needed_cb(webrtcbin);
+    }
+
+    static void on_http_request_cb_static(SoupServer *server, SoupMessage *msg,
+                                          const char *path, GHashTable *query,
+                                          SoupClientContext *client, gpointer user_data) {
+        auto* self = static_cast<Impl*>(user_data);
+        self->on_http_request_cb(server, msg, path, query, client);
+    }
+
+    void on_http_request_cb(SoupServer *server, SoupMessage *msg,
+                            const char *path, GHashTable *query,
+                            SoupClientContext *client) {
+        const char *relative_path = NULL;
+        const char *content_type = NULL;
+
+        if (g_strcmp0(msg->method, SOUP_METHOD_GET) != 0) {
+            soup_message_set_status(msg, SOUP_STATUS_METHOD_NOT_ALLOWED);
+            return;
+        }
+
+        if (g_strcmp0(path, "/") == 0 || g_strcmp0(path, "/index.html") == 0) {
+            relative_path = "index.html";
+            content_type = "text/html; charset=utf-8";
+        } else if (g_strcmp0(path, "/client.js") == 0) {
+            relative_path = "client.js";
+            content_type = "application/javascript; charset=utf-8";
+        } else {
+            soup_message_set_status(msg, SOUP_STATUS_NOT_FOUND);
+            soup_message_set_response(msg, "text/plain; charset=utf-8",
+                                      SOUP_MEMORY_STATIC, "404 Not Found\n", 14);
+            return;
+        }
+
+        gchar *file_path = g_build_filename(BROWSER_CLIENT_DIR, relative_path, NULL);
+        gchar *contents = NULL;
+        gsize length = 0;
+        GError *error = NULL;
+
+        if (!g_file_get_contents(file_path, &contents, &length, &error)) {
+            g_printerr("读取浏览器页面文件失败 %s: %s\n",
+                       file_path, error ? error->message : "unknown error");
+            g_clear_error(&error);
+            g_free(file_path);
+            soup_message_set_status(msg, SOUP_STATUS_NOT_FOUND);
+            soup_message_set_response(msg, "text/plain; charset=utf-8",
+                                      SOUP_MEMORY_STATIC, "404 Not Found\n", 14);
+            return;
+        }
+
+        g_free(file_path);
+        soup_message_set_status(msg, SOUP_STATUS_OK);
+        soup_message_headers_append(msg->response_headers, "Cache-Control", "no-cache");
+        soup_message_set_response(msg, content_type, SOUP_MEMORY_TAKE, contents, length);
     }
 
 
@@ -647,6 +888,20 @@ private:
             GstSDPMessage *sdp = NULL;
             GstWebRTCSessionDescription *answer = NULL;
 
+            if (g_strstr_len(sdp_str, -1, "m=video 0") != NULL) {
+                g_printerr("浏览器拒绝了视频 m-line：answer 里出现 m=video 0。"
+                           "通常是 H264 profile/level 不被浏览器接受；当前 Offer 里的 profile-level-id 需要调成 baseline/constrained-baseline，或降低分辨率/level。\n");
+                offer_in_progress = false;
+                remote_answer_set = true;
+                g_object_unref (parser);
+                return;
+            }
+            if (g_strstr_len(sdp_str, -1, ".local") != NULL) {
+                g_printerr("Answer 里的 ICE candidate 使用了 .local mDNS 地址。"
+                           "如果 webrtcbin 的 ice-connection-state 一直停在 checking/failed，"
+                           "请在浏览器关闭 WebRTC mDNS 隐藏本地 IP，或使用可用的 STUN/TURN。\n");
+            }
+
             g_print ("--> 正在解析远端 Answer SDP...\n");
             if (gst_sdp_message_new_from_text (sdp_str, &sdp) == GST_SDP_OK) {
             
@@ -660,21 +915,25 @@ private:
             gst_promise_interrupt (promise);
             gst_promise_unref (promise);
             gst_webrtc_session_description_free (answer);
+            offer_in_progress = false;
+            remote_answer_set = true;
             
             g_print ("✅ 远端 Answer 设置成功！握手进度 50%%\n");
             } else {
             g_printerr ("无法将 Answer 文本转为 GstSDPMessage！\n");
+            offer_in_progress = false;
             }
         } 
         // ==================== 分支 B：处理远端 ICE ====================
         else if (g_strcmp0 (msg_type, "ice") == 0) {
             gint mline_index = json_object_get_int_member (root_obj, "sdpMLineIndex");
             const gchar *candidate_str = json_object_get_string_member (root_obj, "candidate");
+            std::string candidate = rewrite_mdns_candidate_if_needed(candidate_str);
 
-            g_print ("--> 收到远端网络路径 (ICE): index=%d, %s\n", mline_index, candidate_str);
+            g_print ("--> 收到远端网络路径 (ICE): index=%d, %s\n", mline_index, candidate.c_str());
 
             // 动作指令：喂给 GStreamer 底层引擎去打洞！
-            g_signal_emit_by_name (webrtcbin, "add-ice-candidate", mline_index, candidate_str);
+            g_signal_emit_by_name (webrtcbin, "add-ice-candidate", mline_index, candidate.c_str());
         } 
         else {
             g_print ("未知的包裹类型: %s\n", msg_type);
@@ -691,10 +950,23 @@ private:
 
     void on_ws_closed_cb (SoupWebsocketConnection *connection) {
         g_print ("🛑 网页端关闭了连接，暂停底层流媒体推流。\n");
+
+        bool is_current_connection = false;
+        {
+            std::lock_guard<std::mutex> lock(ws_mutex_);
+            if (connection == ws_conn) {
+                g_clear_object(&ws_conn);
+                is_current_connection = true;
+            }
+        }
         
-        // 网页跑了，把管道设回 NULL 节约板子 CPU，等下一个人进来再重新启动
-        gst_element_set_state (pipeline, GST_STATE_NULL);
-        g_clear_object (&ws_conn);
+        if (is_current_connection) {
+            // 网页跑了，把管道设回 NULL 节约板子 CPU，等下一个人进来再重新启动
+            gst_element_set_state (pipeline, GST_STATE_NULL);
+            offer_in_progress = false;
+            remote_answer_set = false;
+            ws_peer_ip_.clear();
+        }
     }
 
 
