@@ -8,6 +8,7 @@ let pc = null;
 let remoteStream = null;
 let answerSent = false;
 let pendingLocalCandidates = [];
+let pendingRemoteCandidates = [];
 
 // 如果页面是通过 http://<RK3588-IP>/ 打开的，自动把 WebSocket 地址指向同一台板子；
 // 如果直接 file:// 打开，则保留 HTML 里的默认值，用户可以手动改成板子的局域网 IP。
@@ -37,6 +38,7 @@ function connectSignaling(wsUrl) {
   }
   answerSent = false;
   pendingLocalCandidates = [];
+  pendingRemoteCandidates = [];
 
   remoteStream = new MediaStream();
   video.srcObject = remoteStream;
@@ -177,6 +179,10 @@ async function handleOffer(msg) {
     type: "offer",
     sdp: msg.sdp
   });
+  for (const candidate of pendingRemoteCandidates) {
+    await addRemoteCandidate(candidate);
+  }
+  pendingRemoteCandidates = [];
 
   log("create answer");
 
@@ -202,10 +208,21 @@ async function handleOffer(msg) {
 
 async function handleCandidate(msg) {
   if (!pc) {
-    log("pc not ready, ignore candidate");
+    log("pc not ready, queue candidate");
+    pendingRemoteCandidates.push(msg);
     return;
   }
 
+  if (!pc.remoteDescription) {
+    log("remote description not ready, queue candidate");
+    pendingRemoteCandidates.push(msg);
+    return;
+  }
+
+  await addRemoteCandidate(msg);
+}
+
+async function addRemoteCandidate(msg) {
   log("add remote candidate");
 
   await pc.addIceCandidate({

@@ -187,6 +187,13 @@ public:
 
         g_object_set(webrtcbin, "bundle-policy", GST_WEBRTC_BUNDLE_POLICY_MAX_BUNDLE, NULL);
 
+        g_object_set(mpph264enc,
+            "profile", 66,          // baseline; 默认 high(100) 会让部分浏览器拒绝 WebRTC H264
+            "level",   51,          // 5.1，适配 3840x2160@30fps
+            "gop",     VIDEO_FPS,
+            "bps",     12000000,
+            NULL);
+
         gst_bin_add_many(GST_BIN(pipeline),
                         appsrc, tee, queue_rga, appsink, queue_trans, mpph264enc, 
                         h264parse, rtph264pay, rtp_capsfilter, webrtcbin, NULL);
@@ -544,7 +551,7 @@ private:
 
         // 添加 "sdp" 字段，并把刚才获取的 sdp_text 填进去
         json_builder_set_member_name (builder, "sdp");
-        json_builder_add_string_value (builder, "sdp_text");
+        json_builder_add_string_value (builder, sdp_text);
 
         // 结束构建该对象
         json_builder_end_object (builder);
