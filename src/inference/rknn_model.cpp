@@ -5,6 +5,7 @@
 #include <algorithm>
 #include "rknn_api.h"
 #include "postprocess.h"
+#include "config.h"
 
 #include <queue>
 #include <mutex>
@@ -48,7 +49,7 @@ int rknn_model::init(void) {
     int model_size = 0;
     
     // 调用 rknn_init，把模型加载进内存并分配给NPU
-    ret = rknn_init(&ctx, (char *)"/home/cat/gst_core/model/yolov5s-640-640.rknn", model_size, 0, NULL);
+    ret = rknn_init(&ctx, (char *)MODEL_PATH, model_size, 0, NULL);
     if (ret < 0) {
         printf("rknn_init fail! ret=%d\n", ret);
         return -1;

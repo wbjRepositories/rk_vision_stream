@@ -7,7 +7,7 @@
 #define VIDEO_FPS           30
 #define REMOTE_ADDRESS      "192.168.1.7"
 #define REMOTE_PORT         5000
-
-
+#define MODEL_PATH          "../model/yolov5s-640-640.rknn"
+#define LABEL_NALE_TXT_PATH "../model/coco_80_labels_list.txt"
 
 #endif

@@ -16,6 +16,7 @@
 #include <gst/video/video.h>
 #include <gst/app/gstappsink.h>
 #include <poll.h>
+#include <unistd.h>
 #include "gst_rga.h"
 #include "rknn_model.hpp"
 #include <rga/im2d.h>
@@ -55,6 +56,7 @@ private:
     dmabuf  out_buffers[4]{0};
     int     buffers_num{4};
     guint64 frame_count{0};
+    bool    capture_started{false};
 
     // GStreamer 资源
     GstElement* pipeline{nullptr};
@@ -80,7 +82,9 @@ private:
     std::atomic<bool> is_running{false};
 
 public:
-    Impl() = default;
+    Impl() {
+        reset_dmabufs();
+    }
 
     ~Impl() {
         stop();
@@ -127,20 +131,20 @@ public:
             return false;
         }
 
-        appsrc                  = gst_element_factory_make("appsrc",        "v4l2out");
-        GstElement *tee         = gst_element_factory_make("tee",           "tee");
+        appsrc                      = gst_element_factory_make("appsrc",        "v4l2out");
+        GstElement *tee             = gst_element_factory_make("tee",           "tee");
         
         // 分支1：rga缩放给算法
-        GstElement *queue_rga   = gst_element_factory_make("queue",         "q_rga");
-        appsink                 = gst_element_factory_make("appsink",       "appsink");
+        GstElement *queue_rga       = gst_element_factory_make("queue",         "q_rga");
+        appsink                     = gst_element_factory_make("appsink",       "appsink");
 
         // 分支2：远程传输
-        GstElement *queue_trans = gst_element_factory_make("queue",         "q_trans");
-        GstElement *mpph264enc  = gst_element_factory_make("mpph264enc",    "mpph264enc");
-        GstElement *h264parse   = gst_element_factory_make("h264parse",    "h264parse");
-        GstElement *rtph264pay  = gst_element_factory_make("rtph264pay",    "rtph264pay");
-        webrtcbin     = gst_element_factory_make("webrtcbin",       "webrtcbin");
-        GstElement *rtp_capsfilter = gst_element_factory_make("capsfilter", "rtp_caps");
+        GstElement *queue_trans     = gst_element_factory_make("queue",         "q_trans");
+        GstElement *mpph264enc      = gst_element_factory_make("mpph264enc",    "mpph264enc");
+        GstElement *h264parse       = gst_element_factory_make("h264parse",     "h264parse");
+        GstElement *rtph264pay      = gst_element_factory_make("rtph264pay",    "rtph264pay");
+        webrtcbin                   = gst_element_factory_make("webrtcbin",     "webrtcbin");
+        GstElement *rtp_capsfilter  = gst_element_factory_make("capsfilter",    "rtp_caps");
 
         if (!appsrc || !tee || !queue_rga || !appsink || !queue_trans || !mpph264enc || !h264parse || !rtph264pay || !webrtcbin || !rtp_capsfilter) {
             GST_ERROR("有元件创建失败，请检查插件是否安装！\n");
@@ -182,7 +186,7 @@ public:
         g_object_set(rtp_capsfilter, "caps", rtp_caps, NULL);
         gst_caps_unref(rtp_caps);
 
-        g_object_set(rtph264pay, "config-interval", 1, "pt", 96, NULL);
+        g_object_set(rtph264pay, "config-interval", -1, "pt", 96, NULL);
         // g_object_set(udpsink, "host", REMOTE_ADDRESS, "port", REMOTE_PORT, NULL);
 
         g_object_set(webrtcbin, "bundle-policy", GST_WEBRTC_BUNDLE_POLICY_MAX_BUNDLE, NULL);
@@ -260,7 +264,7 @@ public:
             return -1;
         }
 
-        g_print ("\n🚀 WebSocket 信令服务器已启动！\n");
+        g_print ("\nWebSocket 信令服务器已启动！\n");
         g_print ("请在网页浏览器中连接: ws://<板子IP>:8080/ws\n\n");
 
         GstPad *mpph264enc_sink_pad = gst_element_get_static_pad(mpph264enc, "sink");
@@ -295,49 +299,20 @@ public:
     }
 
     bool start() {
-        if (is_running) return true;
-        is_running = true;
-
-        /* ---- 启动 V4L2 流 ---- */
-        v4l2_start_capturing(device_fd, buffers_num, out_buffers);
-
-        /* ---- 启动 pipeline ---- */
-        // GstStateChangeReturn ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
-        // if (ret == GST_STATE_CHANGE_FAILURE) {
-        //     g_printerr("无法将管道设置为 PLAYING 状态！\n");
-        //     gst_object_unref(pipeline);
-        //     // return -1;
-        // }
-        // g_print("管道已进入 PLAYING 状态，开始推流...\n");
-
-        appsrc_thread = std::thread(&Impl::appsrc_push_task,this);
-
-
         // 启动 GMainLoop 线程 (必须有这个，否则 WebRTC 信令和总线消息不工作)
-        main_loop = g_main_loop_new(nullptr, FALSE); // 监听总线
-        loop_thread = std::thread([this]() {
-            g_main_loop_run(main_loop);
-        });
+        if (!main_loop) {
+            main_loop = g_main_loop_new(nullptr, FALSE); // 监听总线
+            loop_thread = std::thread([this]() {
+                g_main_loop_run(main_loop);
+            });
+        }
 
-        // 3. 启动旁路推理线程
-        inference_thread = std::thread(&Impl::inference_task, this);
         return true;
     }
 
     void stop() {
-        if (!is_running) return;
-        is_running = false;
+        stop_capture_threads(true);
 
-        // 通知推理线程退出
-        frame_cv_.notify_all();
-        if (inference_thread.joinable()) {
-            inference_thread.join();
-        }
-
-        // 停止 GStreamer 和 GMainLoop
-        if (pipeline) {
-            gst_element_set_state(pipeline, GST_STATE_NULL);
-        }
         if (main_loop) {
             g_main_loop_quit(main_loop);
             if (loop_thread.joinable()) {
@@ -346,10 +321,125 @@ public:
             g_main_loop_unref(main_loop);
             main_loop = nullptr;
         }
-        // ... 清理其他对象
+
+        if (server) {
+            soup_server_disconnect(server);
+            g_clear_object(&server);
+        }
+        g_clear_object(&ws_conn);
+
+        if (pipeline) {
+            gst_object_unref(pipeline);
+            pipeline = nullptr;
+            appsrc = nullptr;
+            appsink = nullptr;
+            webrtcbin = nullptr;
+        }
+
+        if (allocator) {
+            gst_object_unref(allocator);
+            allocator = nullptr;
+        }
+
+        if (device_fd >= 0) {
+            v4l2_close_device(device_fd);
+            device_fd = -1;
+        }
+        close_dmabufs();
+
+        if (error) {
+            g_clear_error(&error);
+        }
     }
 
 private:
+    void reset_dmabufs() {
+        for (int i = 0; i < buffers_num; ++i) {
+            out_buffers[i].index = i;
+            out_buffers[i].num_planes = 0;
+            for (int p = 0; p < MAX_V4L2_PLANES; ++p) {
+                out_buffers[i].planes[p].fd = -1;
+                out_buffers[i].planes[p].length = 0;
+                out_buffers[i].planes[p].start = nullptr;
+            }
+        }
+    }
+
+    void close_dmabufs() {
+        for (int i = 0; i < buffers_num; ++i) {
+            for (int p = 0; p < MAX_V4L2_PLANES; ++p) {
+                int &fd = out_buffers[i].planes[p].fd;
+                if (fd >= 0) {
+                    close(fd);
+                    fd = -1;
+                }
+            }
+            out_buffers[i].num_planes = 0;
+        }
+    }
+
+    void drain_dma_queue() {
+        std::queue<dma_ctx> pending;
+        {
+            std::lock_guard<std::mutex> lock(frame_mutex_);
+            std::swap(pending, dma_fd_queue);
+        }
+
+        while (!pending.empty()) {
+            dma_ctx dctx = pending.front();
+            pending.pop();
+            if (dctx.sample) {
+                gst_sample_unref(dctx.sample);
+            }
+        }
+    }
+
+    bool start_capture_threads() {
+        if (is_running) return true;
+        if (!pipeline || !appsrc || device_fd < 0) {
+            g_printerr("采集资源尚未初始化，无法启动。\n");
+            return false;
+        }
+
+        frame_count = 0;
+
+        /* ---- 启动 V4L2 流 ---- */
+        if (v4l2_start_capturing(device_fd, buffers_num, out_buffers) != 0) {
+            g_printerr("V4L2 STREAMON 失败，停止启动采集线程。\n");
+            return false;
+        }
+        capture_started = true;
+        is_running = true;
+
+        appsrc_thread = std::thread(&Impl::appsrc_push_task, this);
+        inference_thread = std::thread(&Impl::inference_task, this);
+        return true;
+    }
+
+    void stop_capture_threads(bool set_pipeline_null) {
+        is_running = false;
+        frame_cv_.notify_all();
+
+        if (appsrc_thread.joinable()) {
+            appsrc_thread.join();
+        }
+        if (inference_thread.joinable()) {
+            inference_thread.join();
+        }
+
+        drain_dma_queue();
+
+        if (set_pipeline_null && pipeline) {
+            gst_element_set_state(pipeline, GST_STATE_NULL);
+            gst_element_get_state(pipeline, nullptr, nullptr, 2 * GST_SECOND);
+        }
+
+        if (capture_started && device_fd >= 0) {
+            v4l2_stop_capturing(device_fd);
+            capture_started = false;
+        }
+    }
+
     // 静态中转函数（符合 C 语言签名）
     static gboolean bus_callback_wrapper(GstBus *bus, GstMessage *msg, gpointer user_data) {
         // 3. 将 user_data 强转回 Impl 对象的指针 (this)
@@ -409,20 +499,23 @@ private:
         GstSample* sample = gst_app_sink_pull_sample(GST_APP_SINK(appsink));
         if (!sample) {
             g_printerr("获取sample错误！\n");
+            return GST_FLOW_ERROR;
         }
 
         buffer = gst_sample_get_buffer(sample);
         if (!buffer) {
             g_printerr("获取buffer错误！\n");
+            gst_sample_unref(sample);
+            return GST_FLOW_ERROR;
         }
 
-        // 2. 获取 Buffer 中的第一个内存块 (通常 DMABuf 只有一个 memory block)
+        // 获取 Buffer 中的第一个内存块 (通常 DMABuf 只有一个 memory block)
         GstMemory *mem = gst_buffer_peek_memory(buffer, 0);
         
-        // 3. 检查该内存块是否真的是 DMABUF 类型
+        // 检查该内存块是否真的是 DMABUF 类型
         if (mem && gst_is_dmabuf_memory(mem)) {
             
-            // 4. 提取文件描述符 FD
+            // 提取文件描述符 FD
             // gint fd = gst_dmabuf_memory_get_fd(mem);
             gst_sample_ref(sample);
             dma_ctx dctx;
@@ -434,7 +527,11 @@ private:
                 std::lock_guard<std::mutex> lock(frame_mutex_);
                 // 如果队列积压太多（推理太慢），丢弃旧帧保证实时性
                 if (dma_fd_queue.size() > 2) {
-                    dma_fd_queue.pop(); 
+                    dma_ctx old = dma_fd_queue.front();
+                    dma_fd_queue.pop();
+                    if (old.sample) {
+                        gst_sample_unref(old.sample);
+                    }
                 }
                 dma_fd_queue.push(dctx);
             }
@@ -648,7 +745,7 @@ private:
     void on_web_connected_cb (SoupServer *server, SoupWebsocketConnection *connection,
                                 const char *path, SoupClientContext *client ) {
 
-        g_print ("🎉 叮咚！检测到网页客户端连入 WebSocket!\n");
+        g_print ("检测到网页客户端连入 WebSocket!\n");
 
         // 如果之前已经有网页连着，先把它顶掉（这里做单播演示，方便理解）
         if (ws_conn != NULL) {
@@ -669,6 +766,10 @@ private:
         g_print ("正在唤醒 GStreamer 管道开始推流...\n");
         
         gst_element_set_state (pipeline, GST_STATE_PLAYING);
+        if (!start_capture_threads()) {
+            g_printerr ("底层采集启动失败，回退 GStreamer 管道状态。\n");
+            gst_element_set_state (pipeline, GST_STATE_NULL);
+        }
     }
 
 
@@ -759,10 +860,10 @@ private:
     }
 
     void on_ws_closed_cb (SoupWebsocketConnection *connection) {
-        g_print ("🛑 网页端关闭了连接，暂停底层流媒体推流。\n");
+        g_print ("网页端关闭了连接，暂停底层流媒体推流。\n");
         
-        // 网页跑了，把管道设回 NULL 节约板子 CPU，等下一个人进来再重新启动
-        gst_element_set_state (pipeline, GST_STATE_NULL);
+        // 网页跑了，把采集线程、V4L2 流和管道一起停干净，等下一个人进来再重新启动。
+        stop_capture_threads(true);
         g_clear_object (&ws_conn);
     }
 
@@ -789,12 +890,14 @@ private:
             GstCaps *caps = gst_sample_get_caps(dctx.sample);
             if (!caps) {
                 g_printerr("获取caps失败！\n");
-                return;
+                gst_sample_unref(dctx.sample);
+                continue;
             }
             GstVideoInfo video_info;
             if (!gst_video_info_from_caps(&video_info, caps)) {
                 g_printerr("Failed to parse caps into video info\n");
-                return;
+                gst_sample_unref(dctx.sample);
+                continue;
             }
             
             int dst_fd = model->get_dma_fd();
@@ -812,7 +915,7 @@ private:
             gst_sample_unref(dctx.sample);
             
             // 测试用的伪数据
-            std::vector<BoundingBox> results = {{10, 10, 50, 50, 0, 0.95}};
+            // std::vector<BoundingBox> results = {{10, 10, 50, 50, 0, 0.95}};
 
             // 2. 如果外部注册了回调，把结果甩出去 (甩给 ROS 2)
             // if (inference_cb_) {
@@ -866,7 +969,7 @@ private:
     * ============================================================================ */
     GstFlowReturn push_one_frame(struct dmabuf_buffer *v4l2_buf)
     {
-        /* ---- 1. 复制 fd（GStreamer 会接管所有权）---- */
+        // 复制 fd 给GStreamer用，否则 GstMemory/GstBuffer 释放时，GStreamer 会关闭v4l2_buf->planes[0].fd
         int fd_dup = dup(v4l2_buf->planes[0].fd);
         if (fd_dup < 0) {
             g_printerr("dup DMA-BUF fd 失败！\n");
@@ -874,7 +977,6 @@ private:
             return GST_FLOW_ERROR;
         }
 
-        /* ---- 2. fd → GstMemory ---- */
         GstMemory *mem = gst_dmabuf_allocator_alloc(allocator,
                                                     fd_dup, sizeimage);
         if (!mem) {
@@ -895,7 +997,7 @@ private:
             release_ctx,
             release_v4l2_buffer_when_gst_done);
 
-        /* ---- 3. 添加 GstVideoMeta（告知编码器 NV12 的 stride 和 UV 偏移）---- */
+        // 添加 GstVideoMeta（告知编码器 NV12 的 stride 和 UV 偏移）
         // NV12: Y 平面在前，UV 交错平面在后
         gint   strides[4] = { static_cast<gint>(stride), static_cast<gint>(stride), 0, 0 };
         gsize  offsets[4] = { 0, (gsize)sizeimage * 2 / 3, 0, 0 };
@@ -910,7 +1012,7 @@ private:
             offsets,
             strides);
 
-        /* ---- 4. 打时间戳 ---- */
+        // 打时间戳
         GstClockTime pts = frame_count *
                         (GST_SECOND / VIDEO_FPS);
         GST_BUFFER_PTS(buffer)      = pts;
@@ -918,11 +1020,11 @@ private:
                                                                 VIDEO_FPS);
         frame_count++;
 
-        /* ---- 5. 推入 appsrc（推模式唯一入口）---- */
+        // 推入 appsrc（推模式唯一入口）
         GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(appsrc),
                                                     buffer);
         if (ret != GST_FLOW_OK) {
-            g_printerr("appsrc push buffer 失败: %s (%d)\n",
+            g_printerr("appsrc push buffer 失败: %s (%d)\n", 
                     gst_flow_get_name(ret), ret);
         }
         return ret;
@@ -938,7 +1040,7 @@ private:
     }
 
 
-    /* 【核心】：探针回调函数 */
+    // mpp探针回调函数
     static GstPadProbeReturn osd_probe_callback(
         GstPad *pad,
         GstPadProbeInfo *info,

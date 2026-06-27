@@ -20,10 +20,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
+#include "config.h"
 
 #include <set>
 #include <vector>
-#define LABEL_NALE_TXT_PATH "/home/cat/gst_core/model/coco_80_labels_list.txt"
+
 
 static char *labels[OBJ_CLASS_NUM];
 

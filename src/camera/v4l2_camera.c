@@ -1,17 +1,17 @@
 #define _GNU_SOURCE
 
-#include <stdio.h>      // 标准输入输出
-#include <stdlib.h>     // 标准库，包含 exit() 等
-#include <string.h>     // 字符串操作函数，如 memset()
-#include <assert.h>     // 断言
-#include <fcntl.h>      // 文件控制操作，包含 O_RDWR 等宏
-#include <unistd.h>     // UNIX 标准函数，包含 close(), read() 等
-#include <errno.h>      // 错误码定义，如 EINTR, EAGAIN
-#include <sys/stat.h>   // 文件状态查询
-#include <sys/types.h>  // 基本系统数据类型
-#include <sys/ioctl.h>  // ioctl 系统调用
-#include <sys/mman.h>   // 核心：定义了 PROT_* / MAP_* 宏和 mmap 函数
-#include <linux/videodev2.h> // V4L2 的核心头文件！所有的 V4L2 宏和结构体都在这里
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <assert.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <linux/videodev2.h>
 #include "v4l2_camera.h"
 #include "dma_buffer.h"
 
@@ -50,8 +50,7 @@ int v4l2_open_device(const char *pathname) {
     }
 
     // 打开设备 (避坑：必须使用 O_RDWR)
-    // O_NONBLOCK 表示非阻塞模式。在这个教程的后续，我们会用 select/poll 来等待数据，
-    // 配合 O_NONBLOCK 是最高效的工业级做法，避免进程在内核态死锁。
+    // O_NONBLOCK 表示非阻塞模式。配合 O_NONBLOCK 是最高效的工业级做法，避免进程在内核态死锁。
     fd = open(pathname, O_RDWR | O_NONBLOCK);
     if (-1 == fd) {
         fprintf(stderr, "无法打开 %s : %d，%s", pathname, errno, strerror(errno));
@@ -96,7 +95,7 @@ int v4l2_open_device(const char *pathname) {
 
     // 检查是否支持流式 I/O (STREAMING)
     if (!(caps & V4L2_CAP_STREAMING)) {
-        fprintf(stderr, "%s 不支持 Streaming I/O，本教程不支持老旧的 read/write 模式\n", pathname);
+        fprintf(stderr, "%s 不支持 Streaming I/O，不支持老旧的 read/write 模式\n", pathname);
         goto _ERROR;
     }
 
@@ -355,7 +354,7 @@ int v4l2_start_capturing(int device_fd, unsigned int count, dmabuf *dmabuf_info)
  */
 void v4l2_stop_capturing(int device_fd) {
     enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-    // 即使失败通常也无伤大雅，因为程序都要退出了
+
     if (-1 == xioctl(device_fd, VIDIOC_STREAMOFF, &type)) {
         perror("VIDIOC_STREAMOFF 失败");
     }
