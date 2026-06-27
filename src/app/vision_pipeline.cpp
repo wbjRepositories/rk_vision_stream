@@ -249,6 +249,7 @@ public:
 
         server = soup_server_new (NULL, NULL);
 
+        soup_server_add_handler(server, NULL, on_http_request_cb_static, this, NULL);
         soup_server_add_websocket_handler (server, "/ws", NULL, NULL,
                                      on_web_connected_cb_static, this, NULL);
         
@@ -580,6 +581,59 @@ private:
         g_object_unref (builder);
 
         g_free (sdp_text); // 这是上一步 GStreamer 产生的文本
+    }
+
+    static void on_http_request_cb_static(SoupServer *server, SoupMessage *msg,
+                                          const char *path, GHashTable *query,
+                                          SoupClientContext *client, gpointer user_data) {
+        auto* self = static_cast<Impl*>(user_data);
+        self->on_http_request_cb(server, msg, path, query, client);
+    }
+
+    void on_http_request_cb(SoupServer *server, SoupMessage *msg,
+                            const char *path, GHashTable *query,
+                            SoupClientContext *client) {
+        const char *relative_path = NULL;
+        const char *content_type = NULL;
+
+        if (g_strcmp0(msg->method, SOUP_METHOD_GET) != 0) {
+            soup_message_set_status(msg, SOUP_STATUS_METHOD_NOT_ALLOWED);
+            return;
+        }
+
+        if (g_strcmp0(path, "/") == 0 || g_strcmp0(path, "/index.html") == 0) {
+            relative_path = "index.html";
+            content_type = "text/html; charset=utf-8";
+        } else if (g_strcmp0(path, "/client.js") == 0) {
+            relative_path = "client.js";
+            content_type = "application/javascript; charset=utf-8";
+        } else {
+            soup_message_set_status(msg, SOUP_STATUS_NOT_FOUND);
+            soup_message_set_response(msg, "text/plain; charset=utf-8",
+                                      SOUP_MEMORY_STATIC, "404 Not Found\n", 14);
+            return;
+        }
+
+        gchar *file_path = g_build_filename(BROWSER_CLIENT_DIR, relative_path, NULL);
+        gchar *contents = NULL;
+        gsize length = 0;
+        GError *error = NULL;
+
+        if (!g_file_get_contents(file_path, &contents, &length, &error)) {
+            g_printerr("读取浏览器页面文件失败 %s: %s\n",
+                       file_path, error ? error->message : "unknown error");
+            g_clear_error(&error);
+            g_free(file_path);
+            soup_message_set_status(msg, SOUP_STATUS_NOT_FOUND);
+            soup_message_set_response(msg, "text/plain; charset=utf-8",
+                                      SOUP_MEMORY_STATIC, "404 Not Found\n", 14);
+            return;
+        }
+
+        g_free(file_path);
+        soup_message_set_status(msg, SOUP_STATUS_OK);
+        soup_message_headers_append(msg->response_headers, "Cache-Control", "no-cache");
+        soup_message_set_response(msg, content_type, SOUP_MEMORY_TAKE, contents, length);
     }
 
 
